@@ -259,7 +259,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                     "cell_type": { "type": "string", "enum": ["code", "markdown"] },
                     "edit_mode": { "type": "string", "enum": ["replace", "insert", "delete"] }
                 },
-                "required": ["notebook_path", "new_source"],
+                "required": ["notebook_path"],
                 "additionalProperties": false
             }),
         },
@@ -481,7 +481,7 @@ struct ToolSearchInput {
 struct NotebookEditInput {
     notebook_path: String,
     cell_id: Option<String>,
-    new_source: String,
+    new_source: Option<String>,
     cell_type: Option<NotebookCellType>,
     edit_mode: Option<NotebookEditMode>,
 }
@@ -565,12 +565,17 @@ struct AgentOutput {
     status: String,
     #[serde(rename = "outputFile")]
     output_file: String,
+    #[serde(rename = "manifestFile")]
+    manifest_file: String,
+    #[serde(rename = "createdAt")]
+    created_at: String,
 }
 
 #[derive(Debug, Serialize)]
 struct ToolSearchOutput {
     matches: Vec<String>,
     query: String,
+    normalized_query: String,
     #[serde(rename = "total_deferred_tools")]
     total_deferred_tools: usize,
     #[serde(rename = "pending_mcp_servers")]
@@ -581,7 +586,7 @@ struct ToolSearchOutput {
 struct NotebookEditOutput {
     new_source: String,
     cell_id: Option<String>,
-    cell_type: NotebookCellType,
+    cell_type: Option<NotebookCellType>,
     language: String,
     edit_mode: String,
     error: Option<String>,
@@ -1101,21 +1106,27 @@ fn execute_agent(input: AgentInput) -> Result<AgentOutput, String> {
     std::fs::create_dir_all(&output_dir).map_err(|error| error.to_string())?;
     let output_file = output_dir.join(format!("{agent_id}.md"));
     let manifest_file = output_dir.join(format!("{agent_id}.json"));
+    let normalized_subagent_type = normalize_subagent_type(input.subagent_type.as_deref());
     let agent_name = input
         .name
         .clone()
         .unwrap_or_else(|| slugify_agent_name(&input.description));
+    let created_at = iso8601_now();
 
     let output_contents = format!(
-        "# Agent Task\n\n- id: {}\n- name: {}\n- description: {}\n- subagent_type: {}\n\n## Prompt\n\n{}\n",
-        agent_id,
-        agent_name,
-        input.description,
-        input
-            .subagent_type
-            .clone()
-            .unwrap_or_else(|| String::from("general-purpose")),
-        input.prompt
+        "# Agent Task
+
+- id: {}
+- name: {}
+- description: {}
+- subagent_type: {}
+- created_at: {}
+
+## Prompt
+
+{}
+",
+        agent_id, agent_name, input.description, normalized_subagent_type, created_at, input.prompt
     );
     std::fs::write(&output_file, output_contents).map_err(|error| error.to_string())?;
 
@@ -1123,10 +1134,12 @@ fn execute_agent(input: AgentInput) -> Result<AgentOutput, String> {
         agent_id,
         name: agent_name,
         description: input.description,
-        subagent_type: input.subagent_type,
+        subagent_type: Some(normalized_subagent_type),
         model: input.model,
         status: String::from("queued"),
         output_file: output_file.display().to_string(),
+        manifest_file: manifest_file.display().to_string(),
+        created_at,
     };
     std::fs::write(
         &manifest_file,
@@ -1141,11 +1154,13 @@ fn execute_tool_search(input: ToolSearchInput) -> ToolSearchOutput {
     let deferred = deferred_tool_specs();
     let max_results = input.max_results.unwrap_or(5).max(1);
     let query = input.query.trim().to_string();
+    let normalized_query = normalize_tool_search_query(&query);
     let matches = search_tool_specs(&query, max_results, &deferred);
 
     ToolSearchOutput {
         matches,
         query,
+        normalized_query,
         total_deferred_tools: deferred.len(),
         pending_mcp_servers: None,
     }
@@ -1171,9 +1186,10 @@ fn search_tool_specs(query: &str, max_results: usize, specs: &[ToolSpec]) -> Vec
             .map(str::trim)
             .filter(|part| !part.is_empty())
             .filter_map(|wanted| {
+                let wanted = canonical_tool_token(wanted);
                 specs
                     .iter()
-                    .find(|spec| spec.name.eq_ignore_ascii_case(wanted))
+                    .find(|spec| canonical_tool_token(spec.name) == wanted)
                     .map(|spec| spec.name.to_string())
             })
             .take(max_results)
@@ -1201,13 +1217,20 @@ fn search_tool_specs(query: &str, max_results: usize, specs: &[ToolSpec]) -> Vec
         .iter()
         .filter_map(|spec| {
             let name = spec.name.to_lowercase();
-            let haystack = format!("{name} {}", spec.description.to_lowercase());
+            let canonical_name = canonical_tool_token(spec.name);
+            let normalized_description = normalize_tool_search_query(spec.description);
+            let haystack = format!(
+                "{name} {} {canonical_name}",
+                spec.description.to_lowercase()
+            );
+            let normalized_haystack = format!("{canonical_name} {normalized_description}");
             if required.iter().any(|term| !haystack.contains(term)) {
                 return None;
             }
 
             let mut score = 0_i32;
             for term in &terms {
+                let canonical_term = canonical_tool_token(term);
                 if haystack.contains(term) {
                     score += 2;
                 }
@@ -1216,6 +1239,12 @@ fn search_tool_specs(query: &str, max_results: usize, specs: &[ToolSpec]) -> Vec
                 }
                 if name.contains(term) {
                     score += 4;
+                }
+                if canonical_name == canonical_term {
+                    score += 12;
+                }
+                if normalized_haystack.contains(&canonical_term) {
+                    score += 3;
                 }
             }
 
@@ -1226,12 +1255,34 @@ fn search_tool_specs(query: &str, max_results: usize, specs: &[ToolSpec]) -> Vec
         })
         .collect::<Vec<_>>();
 
-    scored.sort_by(|left, right| right.cmp(left));
+    scored.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
     scored
         .into_iter()
         .map(|(_, name)| name)
         .take(max_results)
         .collect()
+}
+
+fn normalize_tool_search_query(query: &str) -> String {
+    query
+        .trim()
+        .split(|ch: char| ch.is_whitespace() || ch == ',')
+        .filter(|term| !term.is_empty())
+        .map(canonical_tool_token)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn canonical_tool_token(value: &str) -> String {
+    let mut canonical = value
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    if let Some(stripped) = canonical.strip_suffix("tool") {
+        canonical = stripped.to_string();
+    }
+    canonical
 }
 
 fn agent_store_dir() -> Result<std::path::PathBuf, String> {
@@ -1267,6 +1318,33 @@ fn slugify_agent_name(description: &str) -> String {
     out.trim_matches('-').chars().take(32).collect()
 }
 
+fn normalize_subagent_type(subagent_type: Option<&str>) -> String {
+    let trimmed = subagent_type.map(str::trim).unwrap_or_default();
+    if trimmed.is_empty() {
+        return String::from("general-purpose");
+    }
+
+    match canonical_tool_token(trimmed).as_str() {
+        "general" | "generalpurpose" | "generalpurposeagent" => String::from("general-purpose"),
+        "explore" | "explorer" | "exploreagent" => String::from("Explore"),
+        "plan" | "planagent" => String::from("Plan"),
+        "verification" | "verificationagent" | "verify" | "verifier" => {
+            String::from("Verification")
+        }
+        "claudecodeguide" | "claudecodeguideagent" | "guide" => String::from("claude-code-guide"),
+        "statusline" | "statuslinesetup" => String::from("statusline-setup"),
+        _ => trimmed.to_string(),
+    }
+}
+
+fn iso8601_now() -> String {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .to_string()
+}
+
 fn execute_notebook_edit(input: NotebookEditInput) -> Result<NotebookEditOutput, String> {
     let path = std::path::PathBuf::from(&input.notebook_path);
     if path.extension().and_then(|ext| ext.to_str()) != Some("ipynb") {
@@ -1291,38 +1369,35 @@ fn execute_notebook_edit(input: NotebookEditInput) -> Result<NotebookEditOutput,
         .ok_or_else(|| String::from("Notebook cells array not found"))?;
 
     let edit_mode = input.edit_mode.unwrap_or(NotebookEditMode::Replace);
-    let target_index = resolve_cell_index(cells, input.cell_id.as_deref(), edit_mode)?;
-    let resolved_cell_type = input.cell_type.unwrap_or_else(|| {
-        cells
-            .get(target_index)
-            .and_then(|cell| cell.get("cell_type"))
-            .and_then(serde_json::Value::as_str)
-            .map(|kind| {
-                if kind == "markdown" {
-                    NotebookCellType::Markdown
-                } else {
-                    NotebookCellType::Code
-                }
-            })
-            .unwrap_or(NotebookCellType::Code)
-    });
+    let target_index = match input.cell_id.as_deref() {
+        Some(cell_id) => Some(resolve_cell_index(cells, Some(cell_id), edit_mode)?),
+        None if matches!(
+            edit_mode,
+            NotebookEditMode::Replace | NotebookEditMode::Delete
+        ) =>
+        {
+            Some(resolve_cell_index(cells, None, edit_mode)?)
+        }
+        None => None,
+    };
+    let resolved_cell_type = match edit_mode {
+        NotebookEditMode::Delete => None,
+        NotebookEditMode::Insert => Some(input.cell_type.unwrap_or(NotebookCellType::Code)),
+        NotebookEditMode::Replace => Some(input.cell_type.unwrap_or_else(|| {
+            target_index
+                .and_then(|index| cells.get(index))
+                .and_then(cell_kind)
+                .unwrap_or(NotebookCellType::Code)
+        })),
+    };
+    let new_source = require_notebook_source(input.new_source, edit_mode)?;
 
     let cell_id = match edit_mode {
         NotebookEditMode::Insert => {
+            let resolved_cell_type = resolved_cell_type.expect("insert cell type");
             let new_id = make_cell_id(cells.len());
-            let new_cell = json!({
-                "cell_type": match resolved_cell_type { NotebookCellType::Code => "code", NotebookCellType::Markdown => "markdown" },
-                "id": new_id,
-                "metadata": {},
-                "source": source_lines(&input.new_source),
-                "outputs": [],
-                "execution_count": serde_json::Value::Null,
-            });
-            let insert_at = if input.cell_id.is_some() {
-                target_index + 1
-            } else {
-                0
-            };
+            let new_cell = build_notebook_cell(&new_id, resolved_cell_type, &new_source);
+            let insert_at = target_index.map_or(cells.len(), |index| index + 1);
             cells.insert(insert_at, new_cell);
             cells
                 .get(insert_at)
@@ -1331,21 +1406,38 @@ fn execute_notebook_edit(input: NotebookEditInput) -> Result<NotebookEditOutput,
                 .map(ToString::to_string)
         }
         NotebookEditMode::Delete => {
-            let removed = cells.remove(target_index);
+            let removed = cells.remove(target_index.expect("delete target index"));
             removed
                 .get("id")
                 .and_then(serde_json::Value::as_str)
                 .map(ToString::to_string)
         }
         NotebookEditMode::Replace => {
+            let resolved_cell_type = resolved_cell_type.expect("replace cell type");
             let cell = cells
-                .get_mut(target_index)
+                .get_mut(target_index.expect("replace target index"))
                 .ok_or_else(|| String::from("Cell index out of range"))?;
-            cell["source"] = serde_json::Value::Array(source_lines(&input.new_source));
+            cell["source"] = serde_json::Value::Array(source_lines(&new_source));
             cell["cell_type"] = serde_json::Value::String(match resolved_cell_type {
                 NotebookCellType::Code => String::from("code"),
                 NotebookCellType::Markdown => String::from("markdown"),
             });
+            match resolved_cell_type {
+                NotebookCellType::Code => {
+                    if !cell.get("outputs").is_some_and(serde_json::Value::is_array) {
+                        cell["outputs"] = json!([]);
+                    }
+                    if !cell.get("execution_count").is_some() {
+                        cell["execution_count"] = serde_json::Value::Null;
+                    }
+                }
+                NotebookCellType::Markdown => {
+                    if let Some(object) = cell.as_object_mut() {
+                        object.remove("outputs");
+                        object.remove("execution_count");
+                    }
+                }
+            }
             cell.get("id")
                 .and_then(serde_json::Value::as_str)
                 .map(ToString::to_string)
@@ -1357,7 +1449,7 @@ fn execute_notebook_edit(input: NotebookEditInput) -> Result<NotebookEditOutput,
     std::fs::write(&path, &updated_file).map_err(|error| error.to_string())?;
 
     Ok(NotebookEditOutput {
-        new_source: input.new_source,
+        new_source,
         cell_id,
         cell_type: resolved_cell_type,
         language,
@@ -1367,6 +1459,51 @@ fn execute_notebook_edit(input: NotebookEditInput) -> Result<NotebookEditOutput,
         original_file,
         updated_file,
     })
+}
+
+fn require_notebook_source(
+    source: Option<String>,
+    edit_mode: NotebookEditMode,
+) -> Result<String, String> {
+    match edit_mode {
+        NotebookEditMode::Delete => Ok(source.unwrap_or_default()),
+        NotebookEditMode::Insert | NotebookEditMode::Replace => source
+            .ok_or_else(|| String::from("new_source is required for insert and replace edits")),
+    }
+}
+
+fn build_notebook_cell(cell_id: &str, cell_type: NotebookCellType, source: &str) -> Value {
+    let mut cell = json!({
+        "cell_type": match cell_type {
+            NotebookCellType::Code => "code",
+            NotebookCellType::Markdown => "markdown",
+        },
+        "id": cell_id,
+        "metadata": {},
+        "source": source_lines(source),
+    });
+    if let Some(object) = cell.as_object_mut() {
+        match cell_type {
+            NotebookCellType::Code => {
+                object.insert(String::from("outputs"), json!([]));
+                object.insert(String::from("execution_count"), Value::Null);
+            }
+            NotebookCellType::Markdown => {}
+        }
+    }
+    cell
+}
+
+fn cell_kind(cell: &serde_json::Value) -> Option<NotebookCellType> {
+    cell.get("cell_type")
+        .and_then(serde_json::Value::as_str)
+        .map(|kind| {
+            if kind == "markdown" {
+                NotebookCellType::Markdown
+            } else {
+                NotebookCellType::Code
+            }
+        })
 }
 
 fn execute_sleep(input: SleepInput) -> SleepOutput {
@@ -1551,7 +1688,7 @@ fn resolve_cell_index(
             .position(|cell| cell.get("id").and_then(serde_json::Value::as_str) == Some(cell_id))
             .ok_or_else(|| format!("Cell id not found: {cell_id}"))
     } else {
-        Ok(0)
+        Ok(cells.len().saturating_sub(1))
     }
 }
 
@@ -1787,6 +1924,20 @@ mod tests {
             serde_json::from_str(&selected).expect("valid json");
         assert_eq!(selected_output["matches"][0], "Agent");
         assert_eq!(selected_output["matches"][1], "Skill");
+
+        let aliased = execute_tool("ToolSearch", &json!({"query": "AgentTool"}))
+            .expect("ToolSearch should support tool aliases");
+        let aliased_output: serde_json::Value = serde_json::from_str(&aliased).expect("valid json");
+        assert_eq!(aliased_output["matches"][0], "Agent");
+        assert_eq!(aliased_output["normalized_query"], "agent");
+
+        let selected_with_alias =
+            execute_tool("ToolSearch", &json!({"query": "select:AgentTool,Skill"}))
+                .expect("ToolSearch alias select should succeed");
+        let selected_with_alias_output: serde_json::Value =
+            serde_json::from_str(&selected_with_alias).expect("valid json");
+        assert_eq!(selected_with_alias_output["matches"][0], "Agent");
+        assert_eq!(selected_with_alias_output["matches"][1], "Skill");
     }
 
     #[test]
@@ -1816,15 +1967,33 @@ mod tests {
         assert_eq!(output["name"], "ship-audit");
         assert_eq!(output["subagentType"], "Explore");
         assert_eq!(output["status"], "queued");
+        assert!(output["createdAt"].as_str().is_some());
+        let manifest_file = output["manifestFile"].as_str().expect("manifest file");
         let output_file = output["outputFile"].as_str().expect("output file");
         let contents = std::fs::read_to_string(output_file).expect("agent file exists");
+        let manifest_contents =
+            std::fs::read_to_string(manifest_file).expect("manifest file exists");
         assert!(contents.contains("Audit the branch"));
         assert!(contents.contains("Check tests and outstanding work."));
+        assert!(manifest_contents.contains("\"subagentType\": \"Explore\""));
+
+        let normalized = execute_tool(
+            "Agent",
+            &json!({
+                "description": "Verify the branch",
+                "prompt": "Check tests.",
+                "subagent_type": "explorer"
+            }),
+        )
+        .expect("Agent should normalize built-in aliases");
+        let normalized_output: serde_json::Value =
+            serde_json::from_str(&normalized).expect("valid json");
+        assert_eq!(normalized_output["subagentType"], "Explore");
         let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
-    fn notebook_edit_replaces_and_inserts_cells() {
+    fn notebook_edit_replaces_inserts_and_deletes_cells() {
         let path = std::env::temp_dir().join(format!(
             "clawd-notebook-{}.ipynb",
             std::time::SystemTime::now()
@@ -1872,9 +2041,40 @@ mod tests {
         .expect("NotebookEdit insert should succeed");
         let inserted_output: serde_json::Value = serde_json::from_str(&inserted).expect("json");
         assert_eq!(inserted_output["cell_type"], "markdown");
-        let final_notebook = std::fs::read_to_string(&path).expect("read notebook");
-        assert!(final_notebook.contains("print(2)"));
-        assert!(final_notebook.contains("# heading"));
+        let appended = execute_tool(
+            "NotebookEdit",
+            &json!({
+                "notebook_path": path.display().to_string(),
+                "new_source": "print(3)\n",
+                "edit_mode": "insert"
+            }),
+        )
+        .expect("NotebookEdit append should succeed");
+        let appended_output: serde_json::Value = serde_json::from_str(&appended).expect("json");
+        assert_eq!(appended_output["cell_type"], "code");
+
+        let deleted = execute_tool(
+            "NotebookEdit",
+            &json!({
+                "notebook_path": path.display().to_string(),
+                "cell_id": "cell-a",
+                "edit_mode": "delete"
+            }),
+        )
+        .expect("NotebookEdit delete should succeed without new_source");
+        let deleted_output: serde_json::Value = serde_json::from_str(&deleted).expect("json");
+        assert!(deleted_output["cell_type"].is_null());
+        assert_eq!(deleted_output["new_source"], "");
+
+        let final_notebook: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read notebook"))
+                .expect("valid notebook json");
+        let cells = final_notebook["cells"].as_array().expect("cells array");
+        assert_eq!(cells.len(), 2);
+        assert_eq!(cells[0]["cell_type"], "markdown");
+        assert!(cells[0].get("outputs").is_none());
+        assert_eq!(cells[1]["cell_type"], "code");
+        assert_eq!(cells[1]["source"][0], "print(3)\n");
         let _ = std::fs::remove_file(path);
     }
 
