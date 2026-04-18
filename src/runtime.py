@@ -5,7 +5,7 @@ from dataclasses import dataclass
 
 from .commands import PORTED_COMMANDS
 from .llm_client import ask_agentic_llm_json
-from .tools import validate_story_json, run_story_reviewer, run_deterministic_compiler, StoryJSON, CompilerInputs, ReviewResult
+from .tools import validate_story_json, run_story_reviewer, run_deterministic_compiler, assemble_image_prompt_artifact, StoryJSON, CompilerInputs
 from .context import PortContext, build_port_context, render_context, inject_inheritance_context, WebtoonContextManager
 from .history import HistoryLog
 from .models import PermissionDenial, PortingModule, AgentState, StageStatus
@@ -171,6 +171,315 @@ class PortRuntime:
             persisted_session_path=persisted_session_path,
         )
 
+    async def stream_turn_loop(self, prompt: str, max_turns: int = 10):
+        import asyncio
+        from .llm_client import ask_llm_decision, ask_llm_generate, _detect_repetition
+
+        state = AgentState()
+        previous_cut_assets = {}
+        context_mgr = WebtoonContextManager()
+
+        # ── System prompts ─────────────────────────────────────────────
+        decision_system = (
+            "당신은 PrompToon 총괄 웹툰 연출가입니다.\n"
+            "현재 파이프라인 상태를 읽고, 다음에 호출할 도구만 결정하세요.\n"
+            "절대 tool_payload를 포함하지 마세요.\n\n"
+            "사용 가능한 도구:\n"
+            "- validate_story_json (Stage 1→2)\n"
+            "- run_story_reviewer (Stage 2→3)\n"
+            "- run_deterministic_compiler (Stage 3→5)\n"
+            "- none (작업 완료)\n\n"
+            "출력 형식 (JSON only):\n"
+            '{"thought": "추론", "tool_to_use": "도구명"}'
+        )
+
+        story_gen_system = (
+            "You are a Story Creator for the PromToon Inheritance Engine.\n"
+            "Generate a valid story JSON that matches the generator StoryJson contract exactly.\n"
+            "This story is the source document for downstream relational cut authoring.\n\n"
+            "[GLOBAL RULES]\n"
+            "- Output ONLY valid JSON. No markdown fences. No explanation.\n"
+            "- Keep the root shape exactly: meta, phases, ending.\n"
+            "- phases MUST be exactly 3 items with phaseNumber 1, 2, 3 in order.\n"
+            "- Each phase MUST include 5 to 30 scenes and one choice block.\n"
+            "- Each choice MUST contain exactly 2 options.\n"
+            "- ending MUST include poster, endings, buttons, brandText.\n"
+            "- ending.endings MUST contain 3 or 4 items.\n"
+            "- Each ending.lines MUST contain exactly 4 strings.\n\n"
+            "[CRITICAL SCHEMA RULES]\n"
+            "- Spelling matters. Use scene type 'emphasis' exactly. Never write 'enphasis'.\n"
+            "- Every phase MUST include a complete choice object.\n"
+            "- The final JSON MUST include a complete ending object. Never stop before ending.\n"
+            "- psychologyMapping keys must be exactly: boundary_acceptance, action_observation, control_compliance, connection_isolation.\n"
+            "- Never invent alternative keys such as holotype_observation or other variants.\n"
+            "- If you are running out of room, shorten sentences. Do not drop required fields.\n\n"
+            "[VOLUME CONTROL RULES]\n"
+            "- Keep each phase to 5 or 6 scenes total.\n"
+            "- Keep narration and dialogue concise: 1-2 short sentences each.\n"
+            "- Keep choice.reaction to 1 short sentence.\n"
+            "- Keep each ending line short and sharp.\n"
+            "- Prefer compact concrete language over long prose so you can finish all 3 phases and ending.\n\n"
+            "[SCENE AUTHORING RULES]\n"
+            "- Use scene types from this set only: narration, image, dialogue, quote, emphasis, nameInput.\n"
+            "- For type=image, imageDescription is required and must describe visible space, character, lighting, and anchor objects when possible.\n"
+            "- Do not use dialogue text inside imageDescription.\n"
+            "- Use dialogue scenes for spoken lines, narration for exposition, and image scenes for cut extraction targets.\n"
+            "- Each phase should contain at least 2 image scenes.\n"
+            "- choice.imageDescription should be included and should describe an interaction-ready visual moment.\n"
+            "- ending.poster.imageDescription must be a standalone poster-quality establishing image.\n\n"
+            "[META RULES]\n"
+            "- meta.title, meta.subtitle, meta.genre, meta.synopsis must all be present.\n"
+            "- meta.synopsis should preserve the user's synopsis faithfully.\n"
+            "- meta.summary is optional.\n\n"
+            "[JSON SHAPE]\n"
+            "{"
+            "\"meta\":{\"title\":\"str\",\"subtitle\":\"str\",\"genre\":\"str\",\"synopsis\":\"str\",\"summary\":\"str?\"},"
+            "\"phases\":["
+            "{"
+            "\"phaseNumber\":1,"
+            "\"scenes\":["
+            "{\"type\":\"narration\",\"text\":\"str\"},"
+            "{\"type\":\"image\",\"imageDescription\":\"str\",\"imageUrl\":null},"
+            "{\"type\":\"dialogue\",\"speaker\":\"str\",\"text\":\"str\"}"
+            "],"
+            "\"choice\":{"
+            "\"question\":\"str\","
+            "\"imageDescription\":\"str\","
+            "\"imageUrl\":null,"
+            "\"choices\":["
+            "{\"label\":\"str\",\"subtext\":\"str\",\"reaction\":\"str\",\"psychologyMapping\":{\"boundary_acceptance\":-1,\"action_observation\":0,\"control_compliance\":1,\"connection_isolation\":0}},"
+            "{\"label\":\"str\",\"subtext\":\"str\",\"reaction\":\"str\",\"psychologyMapping\":{\"boundary_acceptance\":1,\"action_observation\":0,\"control_compliance\":-1,\"connection_isolation\":0}}"
+            "]"
+            "}"
+            "}"
+            "],"
+            "\"ending\":{"
+            "\"poster\":{\"titleKo\":\"str\",\"titleEn\":\"str\",\"synopsis\":\"str\",\"credit\":\"str\",\"imageDescription\":\"str\",\"imageUrl\":null,\"footerText\":\"str\"},"
+            "\"endings\":[{\"endingId\":\"ending-a\",\"conditionHint\":\"str\",\"typeBadge\":\"str\",\"posterTagline\":\"str\",\"lines\":[\"str\",\"str\",\"str\",\"str\"]}],"
+            "\"buttons\":[\"str\",\"str\"],"
+            "\"brandText\":\"str\""
+            "}"
+            "}\n"
+        )
+
+        # ── Structured retry state ─────────────────────────────────────
+        retry_state = {
+            "last_tool_name": None,
+            "last_payload": None,
+            "last_error_type": None,
+            "json_retry_count": 0,
+            "stage_retry_count": 0,
+            "last_valid_story": None,
+        }
+
+        def _build_history_summary() -> str:
+            parts = []
+            if retry_state["last_tool_name"]:
+                parts.append(f"Last tool: {retry_state['last_tool_name']}")
+            if retry_state["last_error_type"]:
+                parts.append(f"Last error: {retry_state['last_error_type']}")
+            if retry_state["json_retry_count"] > 0:
+                parts.append(f"JSON retries: {retry_state['json_retry_count']}")
+            if retry_state["last_valid_story"]:
+                parts.append("Has valid story from previous stage.")
+            return " | ".join(parts) if parts else "No prior actions."
+
+        yield f"data: {json.dumps({'type': 'init', 'message': 'Engine initialized.'})}\n\n"
+
+        for turn in range(max_turns):
+            if state.status != StageStatus.RUNNING:
+                break
+
+            # Abort if too many stage retries
+            if retry_state["stage_retry_count"] >= 3:
+                state.status = StageStatus.REVIEW_FAILED
+                yield f"data: {json.dumps({'type': 'error', 'message': 'Too many stage retries. Pipeline aborted.'})}\n\n"
+                break
+
+            pinned_context = ""
+            if state.current_stage == 3:
+                mock_current_cut = {"inheritsFromCutId": "PREVIOUS_CUT"}
+                pinned_context = inject_inheritance_context(mock_current_cut, previous_cut_assets)
+
+            history = _build_history_summary()
+            state_info = f"\n[State: Stage {state.current_stage}, Status: {state.status.value}]\n[History: {history}]"
+            turn_prompt = context_mgr.assemble_messages(prompt + state_info, pinned_context)
+
+            # ── Phase A: Decision (short, stable) ──────────────────────
+            yield f"data: {json.dumps({'type': 'thinking', 'turn': turn+1, 'message': f'Stage {state.current_stage}: Deciding next tool...'})}\n\n"
+
+            decision = await asyncio.to_thread(ask_llm_decision, decision_system, turn_prompt)
+            thought = decision.get("thought", "Processing...")
+            tool_name = decision.get("tool_to_use", "none").lower()
+
+            yield f"data: {json.dumps({'type': 'decision', 'turn': turn+1, 'thought': thought, 'tool': tool_name})}\n\n"
+
+            # ── Exit conditions ────────────────────────────────────────
+            if tool_name in ("none", "error"):
+                yield f"data: {json.dumps({'type': 'info', 'message': 'Agent elected to stop.'})}\n\n"
+                break
+
+            # ── Phase B: Generate payload (only for content-heavy tools)
+            tool_result_data = None
+
+            if tool_name == "validate_story_json":
+                yield f"data: {json.dumps({'type': 'generating', 'turn': turn+1, 'message': 'Generating story JSON...'})}\n\n"
+
+                payload = await asyncio.to_thread(
+                    ask_llm_generate,
+                    story_gen_system,
+                    f"시놉시스:\n{prompt}",
+                    max_tokens=5000,
+                    num_ctx=32768,
+                )
+
+                if not payload:
+                    retry_state["json_retry_count"] += 1
+                    retry_state["last_error_type"] = "empty_generation"
+                    retry_state["stage_retry_count"] += 1
+                    msg = f"Story generation returned empty. Retry {retry_state['json_retry_count']}/2"
+                    yield f"data: {json.dumps({'type': 'retry', 'turn': turn+1, 'message': msg})}\n\n"
+                    continue
+
+                # Server-side repetition check
+                raw_str = json.dumps(payload, ensure_ascii=False)
+                if _detect_repetition(raw_str, check_field_lengths=False):
+                    retry_state["json_retry_count"] += 1
+                    retry_state["last_error_type"] = "repetition_detected"
+                    retry_state["stage_retry_count"] += 1
+                    msg = f"Repetition detected in story. Discarding and retrying. ({retry_state['json_retry_count']}/2)"
+                    yield f"data: {json.dumps({'type': 'retry', 'turn': turn+1, 'message': msg})}\n\n"
+                    continue
+
+                try:
+                    yield (
+                        f"data: {json.dumps({'type': 'story_generated', 'turn': turn+1, 'stage': state.current_stage, 'payload': payload}, ensure_ascii=False)}\n\n"
+                    )
+                    story_obj = StoryJSON(**payload)
+                    tool_result_data = validate_story_json(story_obj)
+                    if tool_result_data.get("valid"):
+                        state.current_stage = 2
+                        state.story_data = payload
+                        retry_state["last_valid_story"] = payload
+                        retry_state["json_retry_count"] = 0
+                        retry_state["stage_retry_count"] = 0
+                except Exception as e:
+                    retry_state["json_retry_count"] += 1
+                    retry_state["last_error_type"] = f"validation_error: {e}"
+                    retry_state["last_payload"] = payload
+                    retry_state["stage_retry_count"] += 1
+                    tool_result_data = {"valid": False, "error": str(e)}
+                    msg = f"Story validation failed: {e}. Retry {retry_state['json_retry_count']}/2"
+                    yield f"data: {json.dumps({'type': 'retry', 'turn': turn+1, 'message': msg})}\n\n"
+                    continue
+
+            elif tool_name == "run_story_reviewer":
+                review_input = prompt
+                if retry_state.get("last_valid_story"):
+                    review_input = retry_state["last_valid_story"]
+                review_res = run_story_reviewer(review_input)
+                tool_result_data = review_res.model_dump(mode="json")
+
+                if not review_res.passed:
+                    state.status = StageStatus.REVIEW_FAILED
+                    review_summary = " | ".join(review_res.warnings) if review_res.warnings else "Review failed."
+                    yield f"data: {json.dumps({'type': 'error', 'message': f'[HARD GATE] Stage 2 Review FAILED: {review_summary}'})}\n\n"
+                else:
+                    state.current_stage = 3
+                    previous_cut_assets = {
+                        "location_anchor": "Detected location from review",
+                        "character_dna": {"trait": "Consistent from description"},
+                    }
+
+            elif tool_name == "run_deterministic_compiler":
+                # Decision-only: ask LLM for the compiler payload
+                yield f"data: {json.dumps({'type': 'generating', 'turn': turn+1, 'message': 'Generating compiler inputs...'})}\n\n"
+                compiler_system = (
+                    "You are a Cut Architect for a webtoon production pipeline (v1.1-local schema).\n"
+                    "Generate deterministic compiler input from the given story data.\n\n"
+                    "[CRITICAL RULES]\n"
+                    "1. Output ONLY valid JSON with root keys shared_assets and relational_cuts.\n"
+                    "2. shared_assets must follow schemaVersion=1.0 and use array-based locations/characters/palettes/lightingPresets.\n"
+                    "3. relational_cuts must follow schemaVersion=1.1-local and use root shape {schemaVersion, storyId, sharedAssetsRef, cuts[]}.\n"
+                    "4. Every cut object must include cutId, sceneId, cutType, locationId, summary, continuityLock, frameRelation.\n"
+                    "5. Use real story-derived ids and descriptions. Never use placeholders.\n"
+                    "6. location anchors, character silhouettes, palette, lighting, and inheritance should be explicit when inferable.\n\n"
+                    "JSON Shape:\n"
+                    "{"
+                    "\"shared_assets\":{"
+                    "\"schemaVersion\":\"1.0\","
+                    "\"storyId\":\"story-slug\","
+                    "\"storyTitle\":\"str\","
+                    "\"locations\":[{\"id\":\"str\",\"label\":\"str\",\"baseStructure\":\"str\",\"anchors\":[{\"id\":\"str\",\"description\":\"str\",\"firstAppearanceCutId\":\"str?\"}],\"defaultPaletteId\":\"str?\",\"defaultLightingId\":\"str?\"}],"
+                    "\"characters\":[{\"id\":\"str\",\"role\":\"protagonist|named|group|extra\",\"silhouetteDescription\":\"str\",\"signatureProps\":[\"str\"],\"firstAppearanceCutId\":\"str?\"}],"
+                    "\"palettes\":[{\"id\":\"str\",\"warmLight\":\"#RRGGBB?\",\"base\":\"#RRGGBB?\",\"shadow\":\"#RRGGBB?\",\"accent\":\"#RRGGBB?\",\"description\":\"str?\"}],"
+                    "\"lightingPresets\":[{\"id\":\"str\",\"description\":\"str\",\"mood\":\"str?\"}],"
+                    "\"globalStyle\":{\"styleBlock\":\"str\",\"globalRules\":[\"str\"]}"
+                    "},"
+                    "\"relational_cuts\":{"
+                    "\"schemaVersion\":\"1.1-local\","
+                    "\"storyId\":\"story-slug\","
+                    "\"sharedAssetsRef\":\"./story.shared-assets.json\","
+                    "\"cuts\":[{"
+                    "\"schemaVersion\":\"1.1-local\","
+                    "\"storyId\":\"story-slug\","
+                    "\"sceneId\":\"scene-id\","
+                    "\"cutId\":\"cut-id\","
+                    "\"cutType\":\"establishing|environment_focus|dialogue|interaction|reaction|insert|transition|cliffhanger\","
+                    "\"locationId\":\"location-id\","
+                    "\"summary\":\"str\","
+                    "\"continuityLock\":{\"keepLocation\":true,\"keepAnchors\":[\"str\"],\"keepCharacters\":[\"str\"],\"keepProps\":[\"str\"],\"keepPalette\":true,\"keepLighting\":true,\"keepMood\":true},"
+                    "\"frameRelation\":{\"inheritsFromCutId\":\"str?\",\"temporalRelation\":\"continuous|short_pause|time_jump|flashback|parallel\",\"spatialRelation\":\"same_location_same_axis|same_location_focus_shift|same_location_camera_shift|same_location_new_frame|new_location\",\"shotType\":\"establishing_wide|wide|medium|medium_close_up|close_up|insert|first_person_pov|over_shoulder\"},"
+                    "\"paletteSignature\":{\"paletteId\":\"str?\"},"
+                    "\"characterDeltas\":[],"
+                    "\"propDeltas\":[],"
+                    "\"actionDeltas\":[],"
+                    "\"editingNotes\":[],"
+                    "\"sourceEvidence\":{\"sourceTextIds\":[\"str\"],\"sourceExcerpt\":\"str?\"},"
+                    "\"reviewHints\":{\"ambiguityFlags\":[\"str\"],\"manualReviewRequired\":false,\"suggestedChecks\":[\"str\"]}"
+                    "}]"
+                    "}"
+                    "}\n\n"
+                    "Output ONLY valid JSON. No markdown fences."
+                )
+                payload = await asyncio.to_thread(ask_llm_generate, compiler_system, f"Story:\n{json.dumps(state.story_data or {}, ensure_ascii=False)}")
+                try:
+                    yield (
+                        f"data: {json.dumps({'type': 'compiler_generated', 'turn': turn+1, 'stage': state.current_stage, 'payload': payload}, ensure_ascii=False)}\n\n"
+                    )
+                    compiler_obj = CompilerInputs.model_validate(payload)
+                    compiled_preview = run_deterministic_compiler(
+                        compiler_obj.shared_assets,
+                        compiler_obj.relational_cuts,
+                    )
+                    story_meta = (state.story_data or {}).get("meta", {})
+                    image_prompts = assemble_image_prompt_artifact(
+                        compiler_obj.shared_assets,
+                        compiler_obj.relational_cuts,
+                        compiled_preview,
+                        story_title=story_meta.get("title"),
+                        genre=story_meta.get("genre"),
+                    )
+                    tool_result_data = {
+                        "compiled_preview": compiled_preview.model_dump(mode="json"),
+                        "image_prompts": image_prompts.model_dump(mode="json", by_alias=True),
+                    }
+                    state.current_stage = 5
+                    state.status = StageStatus.COMPLETED
+                except Exception as e:
+                    tool_result_data = {"error": str(e)}
+
+            else:
+                yield f"data: {json.dumps({'type': 'info', 'message': f'Unknown tool: {tool_name}'})}\n\n"
+                continue
+
+            retry_state["last_tool_name"] = tool_name
+            yield f"data: {json.dumps({'type': 'tool_result', 'tool': tool_name, 'status': state.status.value, 'stage': state.current_stage, 'result': tool_result_data})}\n\n"
+
+        final_state = state.model_dump()
+        final_state["status"] = state.status.value
+        yield f"data: {json.dumps({'type': 'completed', 'state': final_state})}\n\n"
+
     def run_turn_loop(self, prompt: str, limit: int = 5, max_turns: int = 5, structured_output: bool = True) -> list[TurnResult]:
         engine = QueryEnginePort.from_workspace()
         results: list[TurnResult] = []
@@ -182,26 +491,41 @@ class PortRuntime:
         
         system_instructions = (
             "당신은 PrompToon의 총괄 웹툰 연출가이자 'Cut Architect'입니다.\n"
-            "당신은 5단계 웹툰 제작 파이프라인(Story Creator -> Story Reviewer -> Cut Architect -> Deterministic Compile -> Polish)을 관리합니다.\n"
-            "현재 상태(AgentState)를 확인하고, 다음에 호출할 도구(tool_to_use)와 그 파라미터(tool_payload)를 JSON 형식으로 반환하세요.\n"
-            "더 이상 호출할 도구가 없거나 파이프라인이 완료되었다면 tool_to_use를 'none'으로 반환하세요.\n"
+            "5단계 파이프라인(Story Creator -> Story Reviewer -> Cut Architect -> Deterministic Compile -> Polish)을 관리합니다.\n"
+            "현재 상태(AgentState)를 확인하고, 다음에 호출할 도구(tool_to_use)와 파라미터(tool_payload)를 JSON으로 반환하세요.\n"
             "\n"
-            "사용 가능한 도구 및 Payload 규칙:\n"
-            "1. validate_story_json: [Stage 1 -> 2 진행용]\n"
-            "   - 당신이 직접 사용자의 시놉시스를 바탕으로 3-Phase 스토리를 창작하여 payload로 전달합니다.\n"
-            "   - payload 형식: {\"meta\": {\"genre\": \"\"}, \"phases\": [{\"name\": \"\", \"description\": \"\", \"events\": []}, ...총 3개...], \"ending\": \"\"}\n"
-            "2. run_story_reviewer: [Stage 2 -> 3 진행용]\n"
-            "   - 창작된 스토리의 품질을 검수합니다.\n"
-            "   - payload 형식: {\"text\": \"전체 스토리 요약 텍스트\"}\n"
-            "3. run_deterministic_compiler: [Stage 3 -> 5 진행용]\n"
-            "   - 캐릭터/배경 자산과 컷 관계를 조립해 프롬프트를 생성합니다.\n"
-            "   - payload 형식: {\"shared_assets\": {\"characters\": {}, \"locations\": {}}, \"relational_cuts\": [{\"character\": \"\", \"action\": \"\"}]}\n"
+            "[STAGE 1: validate_story_json — Story Creator (19-Cut Volume)]\n"
+            "- 시놉시스를 generator StoryJson 계약으로 확장합니다.\n"
+            "- root shape는 반드시 meta, phases, ending 이어야 합니다.\n"
+            "- phases는 정확히 3개이며 phaseNumber는 1, 2, 3 순서여야 합니다.\n"
+            "- 각 phase는 scenes 배열과 choice 블록을 포함해야 합니다.\n"
+            "- 각 phase의 scenes는 5개 또는 6개로 제한합니다.\n"
+            "- scenes는 narration, image, dialogue, quote, emphasis, nameInput 타입만 사용합니다.\n"
+            "- 'emphasis' 철자를 정확히 써야 하며 'enphasis' 오타는 금지합니다.\n"
+            "- image scene은 imageDescription이 필수이며, 공간/인물/조명/오브젝트가 구분 가능해야 합니다.\n"
+            "- 각 phase choice는 question, imageDescription, choices 2개를 포함해야 합니다.\n"
+            "- psychologyMapping 키는 boundary_acceptance, action_observation, control_compliance, connection_isolation 네 개만 허용됩니다.\n"
+            "- ending은 poster, endings, buttons, brandText를 포함해야 하며 poster.imageDescription이 필수입니다.\n"
+            "- required field를 생략하지 말고, 길이가 부담되면 문장을 더 짧게 씁니다.\n"
+            "\n"
+            "[STAGE 2: run_story_reviewer — Quality Gate]\n"
+            "- payload: StoryJson object itself, or {\"text\": \"StoryJson string\"}\n"
+            "\n"
+            "[STAGE 3: run_deterministic_compiler — Cut Architect (v1.1-local)]\n"
+            "- output root는 shared_assets + relational_cuts 이어야 합니다.\n"
+            "- shared_assets는 schemaVersion=1.0, storyId, storyTitle, locations[], characters[], palettes[], lightingPresets[]를 포함합니다.\n"
+            "- relational_cuts는 schemaVersion=1.1-local, storyId, sharedAssetsRef, cuts[]를 포함합니다.\n"
+            "- 각 cut은 sceneId, cutId, cutType, locationId, summary, continuityLock, frameRelation을 반드시 포함해야 합니다.\n"
+            "- placeholder 금지. story에서 실제 공간/인물/소품/조명 단서를 추출해야 합니다.\n"
+            "- payload schema:\n"
+            "  {\"shared_assets\":{\"schemaVersion\":\"1.0\",\"storyId\":\"\",\"storyTitle\":\"\",\"locations\":[],\"characters\":[],\"palettes\":[],\"lightingPresets\":[]},\n"
+            "   \"relational_cuts\":{\"schemaVersion\":\"1.1-local\",\"storyId\":\"\",\"sharedAssetsRef\":\"./story.shared-assets.json\",\"cuts\":[]}}\n"
             "\n"
             "출력 형식 (JSON strictly):\n"
             "{\n"
-            "  \"thought\": \"현재 단계와 실패/성공 여부에 따른 다음 행동 추론\",\n"
+            "  \"thought\": \"현재 상황 추론\",\n"
             "  \"tool_to_use\": \"도구 이름 또는 'none'\",\n"
-            "  \"tool_payload\": { 도구에 전달할 데이터 }\n"
+            "  \"tool_payload\": { 도구 데이터 }\n"
             "}"
         )
 
@@ -242,19 +566,24 @@ class PortRuntime:
                 try:
                     story_obj = StoryJSON(**payload)
                     tool_result_data = validate_story_json(story_obj)
+                    tool_result_data["story"] = payload
                     if tool_result_data.get("valid"):
                         state.current_stage = 2
+                        state.story_data = payload
                 except Exception as e:
                     tool_result_data = {"valid": False, "error": str(e)}
             
             elif tool_name == "run_story_reviewer":
-                text_to_review = payload.get("text", prompt)
-                review_res = run_story_reviewer(text_to_review)
-                tool_result_data = {"passed": review_res.passed, "report": review_res.report}
+                review_input = payload if payload else state.story_data or prompt
+                if isinstance(payload, dict) and "text" in payload and len(payload) == 1:
+                    review_input = payload.get("text", prompt)
+                review_res = run_story_reviewer(review_input)
+                tool_result_data = review_res.model_dump(mode="json")
                 
                 if not review_res.passed:
                     state.status = StageStatus.REVIEW_FAILED
-                    output_msg += f"\n[CRITICAL] Stage 2 Quality Review FAILED: {review_res.report}\n"
+                    review_summary = " | ".join(review_res.warnings) if review_res.warnings else "Review failed."
+                    output_msg += f"\n[CRITICAL] Stage 2 Quality Review FAILED: {review_summary}\n"
                 else:
                     state.current_stage = 3
                     previous_cut_assets = {
@@ -264,12 +593,24 @@ class PortRuntime:
             
             elif tool_name == "run_deterministic_compiler":
                 try:
-                    compiled_prompts = run_deterministic_compiler(
-                        payload.get("shared_assets", {}), 
-                        payload.get("relational_cuts", [])
+                    compiler_obj = CompilerInputs.model_validate(payload)
+                    compiled_preview = run_deterministic_compiler(
+                        compiler_obj.shared_assets,
+                        compiler_obj.relational_cuts,
                     )
-                    tool_result_data = {"prompts": compiled_prompts}
-                    output_msg += f"\n--- Compiled Prompts ---\n{compiled_prompts}\n"
+                    story_meta = (state.story_data or {}).get("meta", {})
+                    image_prompts = assemble_image_prompt_artifact(
+                        compiler_obj.shared_assets,
+                        compiler_obj.relational_cuts,
+                        compiled_preview,
+                        story_title=story_meta.get("title"),
+                        genre=story_meta.get("genre"),
+                    )
+                    tool_result_data = {
+                        "compiled_preview": compiled_preview.model_dump(mode="json"),
+                        "image_prompts": image_prompts.model_dump(mode="json", by_alias=True),
+                    }
+                    output_msg += f"\n--- Image Prompt Artifact ---\n{image_prompts.model_dump_json(indent=2, by_alias=True)}\n"
                     state.current_stage = 5
                     state.status = StageStatus.COMPLETED
                 except Exception as e:
