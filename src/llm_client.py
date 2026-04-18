@@ -29,8 +29,10 @@ def ask_agentic_llm_json(system_prompt: str, user_prompt: str, model: str = "gem
                 {"role": "user", "content": user_prompt}
             ],
             response_format={"type": "json_object"},
-            temperature=0.7,
-            max_tokens=2000
+            temperature=0.3,          # 0.1 이하라면 0.3~0.4 정도로 살짝 올려 반복을 깹니다.
+            max_tokens=4096,          # 출력이 잘리지 않도록 충분히 큰 값을 줍니다.
+            presence_penalty=0.5,     # 무한 반복 방지 옵션 (지원되는 경우)
+            frequency_penalty=0.5     # 무한 반복 방지 옵션 (지원되는 경우)
         )
         
         content = response.choices[0].message.content
