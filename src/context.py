@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 
 @dataclass(frozen=True)
@@ -45,3 +47,41 @@ def render_context(context: PortContext) -> str:
         f'Assets: {context.asset_file_count}',
         f'Archive available: {context.archive_available}',
     ])
+
+
+# --- Webtoon Inheritance Chain Context ---
+
+def inject_inheritance_context(current_cut: Dict[str, Any], previous_cut_assets: Dict[str, Any]) -> str:
+    """
+    Constructs a pinned context block for visual continuity between cuts.
+    """
+    if "inheritsFromCutId" not in current_cut:
+        return ""
+    
+    inherited_id = current_cut["inheritsFromCutId"]
+    location = previous_cut_assets.get("location_anchor", "N/A")
+    character_dna = previous_cut_assets.get("character_dna", {})
+    
+    dna_str = ", ".join([f"{k}: {v}" for k, v in character_dna.items()]) if character_dna else "Standard DNA"
+    
+    pinned_block = [
+        f"### 🔗 INHERITANCE CONTEXT (From Cut: {inherited_id})",
+        f"**Location Anchor**: {location}",
+        f"**Character DNA**: {dna_str}",
+        "---",
+        "**Instruction**: 상기 'Location Anchor'와 'Character DNA'를 엄격히 준수하여 비주얼 일관성을 유지하라."
+    ]
+    
+    return "\n".join(pinned_block)
+
+
+class WebtoonContextManager:
+    """
+    Manages the assembly of prompt messages with pinned context blocks.
+    """
+    @staticmethod
+    def assemble_messages(base_prompt: str, pinned_context: str = "") -> str:
+        if not pinned_context:
+            return base_prompt
+            
+        return f"{pinned_context}\n\n{base_prompt}"
