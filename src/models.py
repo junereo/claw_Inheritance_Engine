@@ -1,6 +1,19 @@
 from __future__ import annotations
-
+from enum import Enum
+from typing import Any, Dict, List
+from pydantic import BaseModel, Field
 from dataclasses import dataclass, field
+
+class StageStatus(Enum):
+    RUNNING = "running"
+    COMPLETED = "completed"
+    REVIEW_FAILED = "review_failed"
+
+class AgentState(BaseModel):
+    current_stage: int = 1
+    status: StageStatus = StageStatus.RUNNING
+    story_data: Dict[str, Any] = Field(default_factory=dict)
+    history: List[str] = Field(default_factory=list)
 
 
 @dataclass(frozen=True)

@@ -10,18 +10,14 @@ from .tools import get_tools
 @dataclass(frozen=True)
 class ToolPool:
     tools: tuple[PortingModule, ...]
-    simple_mode: bool
-    include_mcp: bool
 
     def as_markdown(self) -> str:
         lines = [
-            '# Tool Pool',
+            '# Webtoon Tool Pool',
             '',
-            f'Simple mode: {self.simple_mode}',
-            f'Include MCP: {self.include_mcp}',
             f'Tool count: {len(self.tools)}',
         ]
-        lines.extend(f'- {tool.name} — {tool.source_hint}' for tool in self.tools[:15])
+        lines.extend(f'- {tool.name} — {tool.responsibility}' for tool in self.tools)
         return '\n'.join(lines)
 
 
@@ -30,8 +26,7 @@ def assemble_tool_pool(
     include_mcp: bool = True,
     permission_context: ToolPermissionContext | None = None,
 ) -> ToolPool:
+    # We ignore simple_mode and include_mcp as our pipeline tools are the only ones active.
     return ToolPool(
         tools=get_tools(simple_mode=simple_mode, include_mcp=include_mcp, permission_context=permission_context),
-        simple_mode=simple_mode,
-        include_mcp=include_mcp,
     )
