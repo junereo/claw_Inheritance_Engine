@@ -1479,3 +1479,177 @@ def render_tool_index(limit: int = 20, query: str | None = None) -> str:
     lines = [f"Webtoon Tool entries: {len(PORTED_TOOLS)}", ""]
     lines.extend(f"- {module.name} — {module.responsibility}" for module in PORTED_TOOLS)
     return "\n".join(lines)
+def parse_text_to_story_json(text: str) -> dict[str, Any]:
+    """
+    Parses structured text (tag-based) into a StoryJSON compatible dictionary.
+    Supports # META, # PHASE N, # PHASE N CHOICE, # ENDING POSTER, # ENDING LIST, # INTERFACE.
+    """
+    story = {
+        "meta": {},
+        "phases": [],
+        "ending": {
+            "poster": {},
+            "endings": [],
+            "buttons": [],
+        }
+    }
+    
+    current_section = None
+    current_phase = None
+    
+    lines = text.split("\n")
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+            
+        if line.startswith("# META"):
+            current_section = "META"
+            continue
+        elif line.startswith("# PHASE") and "CHOICE" in line:
+            try:
+                num = int(re.search(r"PHASE (\d+)", line).group(1))
+                current_section = f"PHASE_{num}_CHOICE"
+                # Find phase object to attach choice to
+                current_phase = next((p for p in story["phases"] if p["phaseNumber"] == num), None)
+                if not current_phase:
+                    current_phase = {"phaseNumber": num, "scenes": [], "choice": {"choices": []}}
+                    story["phases"].append(current_phase)
+                if "choice" not in current_phase:
+                    current_phase["choice"] = {"choices": []}
+            except:
+                pass
+            continue
+        elif line.startswith("# PHASE"):
+            try:
+                num = int(re.search(r"PHASE (\d+)", line).group(1))
+                current_section = f"PHASE_{num}"
+                current_phase = next((p for p in story["phases"] if p["phaseNumber"] == num), None)
+                if not current_phase:
+                    current_phase = {"phaseNumber": num, "scenes": [], "choice": {"choices": []}}
+                    story["phases"].append(current_phase)
+            except:
+                pass
+            continue
+        elif line.startswith("# ENDING POSTER"):
+            current_section = "ENDING_POSTER"
+            continue
+        elif line.startswith("# ENDING LIST"):
+            current_section = "ENDING_LIST"
+            continue
+        elif line.startswith("# INTERFACE"):
+            current_section = "INTERFACE"
+            continue
+
+        # Parsing based on section
+        if current_section == "META":
+            if ":" in line:
+                key, val = line.split(":", 1)
+                key = key.strip().lower()
+                story["meta"][key] = val.strip()
+                
+        elif current_section and current_section.startswith("PHASE_") and not current_section.endswith("_CHOICE"):
+            if line.startswith("["):
+                # Scene: [TYPE | ... ] TEXT
+                match = re.search(r"\[(.*?)(?:\|(.*?))?\](.*)", line)
+                if match:
+                    stype = match.group(1).strip().lower()
+                    meta = match.group(2).strip() if match.group(2) else ""
+                    content = match.group(3).strip()
+                    
+                    scene = {"type": stype}
+                    if stype == "narration" or stype == "quote" or stype == "emphasis":
+                        scene["text"] = content
+                    elif stype == "image":
+                        scene["imageDescription"] = content
+                    elif stype == "dialogue":
+                        scene["speaker"] = meta
+                        scene["text"] = content
+                    elif stype == "nameinput":
+                        scene["type"] = "nameInput"
+                        parts = meta.split("|")
+                        scene["placeholder"] = parts[0].strip() if len(parts) > 0 else "Enter name"
+                        scene["variableName"] = parts[1].strip() if len(parts) > 1 else "userName"
+                        scene["text"] = content
+                    
+                    if current_phase is not None:
+                        current_phase["scenes"].append(scene)
+
+        elif current_section and current_section.endswith("_CHOICE"):
+            if ":" in line:
+                key, val = line.split(":", 1)
+                key = key.strip().upper()
+                if key == "QUESTION":
+                    current_phase["choice"]["question"] = val.strip()
+                elif key == "IMAGE_DESCRIPTION":
+                    current_phase["choice"]["imageDescription"] = val.strip()
+                elif key.startswith("OPTION"):
+                    # OPTION 1: Label | Subtext | Reaction | [MAP: 0, 0, 0, 0]
+                    parts = val.split("|")
+                    if len(parts) >= 3:
+                        label = parts[0].strip()
+                        subtext = parts[1].strip()
+                        reaction = parts[2].strip()
+                        mapping = {"boundary_acceptance": 0, "action_observation": 0, "control_compliance": 0, "connection_isolation": 0}
+                        if len(parts) >= 4 and "[MAP:" in parts[3]:
+                            map_match = re.search(r"\[MAP:\s*(-?\d+)\s*,\s*(-?\d+)\s*,\s*(-?\d+)\s*,\s*(-?\d+)\s*\]", parts[3])
+                            if map_match:
+                                m_vals = [int(v) for v in map_match.groups()]
+                                mapping = {
+                                    "boundary_acceptance": m_vals[0],
+                                    "action_observation": m_vals[1],
+                                    "control_compliance": m_vals[2],
+                                    "connection_isolation": m_vals[3]
+                                }
+                        current_phase["choice"]["choices"].append({
+                            "label": label,
+                            "subtext": subtext,
+                            "reaction": reaction,
+                            "psychologyMapping": mapping
+                        })
+
+        elif current_section == "ENDING_POSTER":
+            if ":" in line:
+                raw_key, val = line.split(":", 1)
+                key = "".join(x.capitalize() for x in raw_key.strip().lower().split("_"))
+                key = key[0].lower() + key[1:] # camelCase
+                # Special cases for schema
+                if key == "titleKo": story["ending"]["poster"]["titleKo"] = val.strip()
+                elif key == "titleEn": story["ending"]["poster"]["titleEn"] = val.strip()
+                elif key == "synopsis": story["ending"]["poster"]["synopsis"] = val.strip()
+                elif key == "credit": story["ending"]["poster"]["credit"] = val.strip()
+                elif key == "imageDescription": story["ending"]["poster"]["imageDescription"] = val.strip()
+                elif key == "footer": story["ending"]["poster"]["footerText"] = val.strip()
+
+        elif current_section == "ENDING_LIST":
+            if line.startswith("-"):
+                # - ID: ... | CONDITION: ... | BADGE: ... | TAGLINE: ... | LINES: l1, l2, l3, l4
+                line = line.lstrip("- ").strip()
+                parts = line.split("|")
+                item = {}
+                for p in parts:
+                    if ":" in p:
+                        pk, pv = p.split(":", 1)
+                        pk = pk.strip().upper()
+                        pv = pv.strip()
+                        if pk == "ID": item["endingId"] = pv
+                        elif pk == "CONDITION": item["conditionHint"] = pv
+                        elif pk == "BADGE": item["typeBadge"] = pv
+                        elif pk == "TAGLINE": item["posterTagline"] = pv
+                        elif pk == "LINES": item["lines"] = [s.strip() for s in pv.split(",")]
+                if item:
+                    story["ending"]["endings"].append(item)
+
+        elif current_section == "INTERFACE":
+            if ":" in line:
+                key, val = line.split(":", 1)
+                key = key.strip().upper()
+                if key == "BUTTONS":
+                    story["ending"]["buttons"] = [s.strip() for s in val.split(",")]
+                elif key == "BRAND_TEXT":
+                    story["ending"]["brandText"] = val.strip()
+
+    # Ensure phases are sorted
+    story["phases"].sort(key=lambda p: p.get("phaseNumber", 0))
+    
+    return story

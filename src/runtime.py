@@ -195,71 +195,45 @@ class PortRuntime:
 
         story_gen_system = (
             "You are a Story Creator for the PromToon Inheritance Engine.\n"
-            "Generate a valid story JSON that matches the generator StoryJson contract exactly.\n"
-            "This story is the source document for downstream relational cut authoring.\n\n"
-            "[GLOBAL RULES]\n"
-            "- Output ONLY valid JSON. No markdown fences. No explanation.\n"
-            "- Keep the root shape exactly: meta, phases, ending.\n"
-            "- phases MUST be exactly 3 items with phaseNumber 1, 2, 3 in order.\n"
-            "- Each phase MUST include 5 to 30 scenes and one choice block.\n"
-            "- Each choice MUST contain exactly 2 options.\n"
-            "- ending MUST include poster, endings, buttons, brandText.\n"
-            "- ending.endings MUST contain 3 or 4 items.\n"
-            "- Each ending.lines MUST contain exactly 4 strings.\n\n"
-            "[CRITICAL SCHEMA RULES]\n"
-            "- Spelling matters. Use scene type 'emphasis' exactly. Never write 'enphasis'.\n"
-            "- Every phase MUST include a complete choice object.\n"
-            "- The final JSON MUST include a complete ending object. Never stop before ending.\n"
-            "- psychologyMapping keys must be exactly: boundary_acceptance, action_observation, control_compliance, connection_isolation.\n"
-            "- Never invent alternative keys such as holotype_observation or other variants.\n"
-            "- If you are running out of room, shorten sentences. Do not drop required fields.\n\n"
-            "[VOLUME CONTROL RULES]\n"
-            "- Keep each phase to 5 or 6 scenes total.\n"
-            "- Keep narration and dialogue concise: 1-2 short sentences each.\n"
-            "- Keep choice.reaction to 1 short sentence.\n"
-            "- Keep each ending line short and sharp.\n"
-            "- Prefer compact concrete language over long prose so you can finish all 3 phases and ending.\n\n"
-            "[SCENE AUTHORING RULES]\n"
-            "- Use scene types from this set only: narration, image, dialogue, quote, emphasis, nameInput.\n"
-            "- For type=image, imageDescription is required and must describe visible space, character, lighting, and anchor objects when possible.\n"
-            "- Do not use dialogue text inside imageDescription.\n"
-            "- Use dialogue scenes for spoken lines, narration for exposition, and image scenes for cut extraction targets.\n"
-            "- Each phase should contain at least 2 image scenes.\n"
-            "- choice.imageDescription should be included and should describe an interaction-ready visual moment.\n"
-            "- ending.poster.imageDescription must be a standalone poster-quality establishing image.\n\n"
-            "[META RULES]\n"
-            "- meta.title, meta.subtitle, meta.genre, meta.synopsis must all be present.\n"
-            "- meta.synopsis should preserve the user's synopsis faithfully.\n"
-            "- meta.summary is optional.\n\n"
-            "[JSON SHAPE]\n"
-            "{"
-            "\"meta\":{\"title\":\"str\",\"subtitle\":\"str\",\"genre\":\"str\",\"synopsis\":\"str\",\"summary\":\"str?\"},"
-            "\"phases\":["
-            "{"
-            "\"phaseNumber\":1,"
-            "\"scenes\":["
-            "{\"type\":\"narration\",\"text\":\"str\"},"
-            "{\"type\":\"image\",\"imageDescription\":\"str\",\"imageUrl\":null},"
-            "{\"type\":\"dialogue\",\"speaker\":\"str\",\"text\":\"str\"}"
-            "],"
-            "\"choice\":{"
-            "\"question\":\"str\","
-            "\"imageDescription\":\"str\","
-            "\"imageUrl\":null,"
-            "\"choices\":["
-            "{\"label\":\"str\",\"subtext\":\"str\",\"reaction\":\"str\",\"psychologyMapping\":{\"boundary_acceptance\":-1,\"action_observation\":0,\"control_compliance\":1,\"connection_isolation\":0}},"
-            "{\"label\":\"str\",\"subtext\":\"str\",\"reaction\":\"str\",\"psychologyMapping\":{\"boundary_acceptance\":1,\"action_observation\":0,\"control_compliance\":-1,\"connection_isolation\":0}}"
-            "]"
-            "}"
-            "}"
-            "],"
-            "\"ending\":{"
-            "\"poster\":{\"titleKo\":\"str\",\"titleEn\":\"str\",\"synopsis\":\"str\",\"credit\":\"str\",\"imageDescription\":\"str\",\"imageUrl\":null,\"footerText\":\"str\"},"
-            "\"endings\":[{\"endingId\":\"ending-a\",\"conditionHint\":\"str\",\"typeBadge\":\"str\",\"posterTagline\":\"str\",\"lines\":[\"str\",\"str\",\"str\",\"str\"]}],"
-            "\"buttons\":[\"str\",\"str\"],"
-            "\"brandText\":\"str\""
-            "}"
-            "}\n"
+            "Generate a structured story text using the exactly following TAG format.\n"
+            "DO NOT OUTPUT JSON. Use only the tags below.\n\n"
+            "[FORMAT]\n"
+            "# META\n"
+            "TITLE: <text>\n"
+            "SUBTITLE: <text>\n"
+            "GENRE: <text>\n"
+            "SYNOPSIS: <text>\n"
+            "SUMMARY: <text>\n\n"
+            "# PHASE 1\n"
+            "[NARRATION] <text>\n"
+            "[IMAGE] <description of visual>\n"
+            "[DIALOGUE | SpeakerName] <lines>\n"
+            "... (repeat for 5-6 scenes)\n\n"
+            "# PHASE 1 CHOICE\n"
+            "QUESTION: <choice question>\n"
+            "IMAGE_DESCRIPTION: <visual for choice>\n"
+            "---\n"
+            "OPTION 1: Label | Subtext | Reaction | [MAP: boundary, action, control, connection]\n"
+            "OPTION 2: Label | Subtext | Reaction | [MAP: boundary, action, control, connection]\n\n"
+            "(Repeat # PHASE 2, # PHASE 3 in the same way)\n\n"
+            "# ENDING POSTER\n"
+            "TITLE_KO: <text>\n"
+            "TITLE_EN: <text>\n"
+            "SYNOPSIS: <text>\n"
+            "CREDIT: <text>\n"
+            "IMAGE_DESCRIPTION: <text>\n"
+            "FOOTER: <text>\n\n"
+            "# ENDING LIST\n"
+            "- ID: ending-a | CONDITION: <hint> | BADGE: <badge> | TAGLINE: <text> | LINES: l1, l2, l3, l4\n"
+            "(Provide 3 or 4 endings)\n\n"
+            "# INTERFACE\n"
+            "BUTTONS: <btn1>, <btn2>\n"
+            "BRAND_TEXT: <text>\n\n"
+            "[RULES]\n"
+            "- psychologyMapping (MAP) values are integers (typically -1, 0, 1).\n"
+            "- Each phase MUST have 5-6 scenes and exactly 2 options.\n"
+            "- imageDescription must be descriptive and visual.\n"
+            "- Keep narration and dialogue concise.\n"
         )
 
         # ── Structured retry state ─────────────────────────────────────
@@ -325,15 +299,17 @@ class PortRuntime:
             if tool_name == "validate_story_json":
                 yield f"data: {json.dumps({'type': 'generating', 'turn': turn+1, 'message': 'Generating story JSON...'})}\n\n"
 
-                payload = await asyncio.to_thread(
+                # ── Text Output → Python Template Parser Logic ──
+                raw_text = await asyncio.to_thread(
                     ask_llm_generate,
                     story_gen_system,
                     f"시놉시스:\n{prompt}",
-                    max_tokens=5000,
+                    max_tokens=StoryMaxTokens if 'StoryMaxTokens' in locals() else 5000,
                     num_ctx=32768,
+                    json_mode=False
                 )
 
-                if not payload:
+                if not raw_text or len(raw_text) < 100:
                     retry_state["json_retry_count"] += 1
                     retry_state["last_error_type"] = "empty_generation"
                     retry_state["stage_retry_count"] += 1
@@ -341,9 +317,8 @@ class PortRuntime:
                     yield f"data: {json.dumps({'type': 'retry', 'turn': turn+1, 'message': msg})}\n\n"
                     continue
 
-                # Server-side repetition check
-                raw_str = json.dumps(payload, ensure_ascii=False)
-                if _detect_repetition(raw_str, check_field_lengths=False):
+                # Server-side repetition check on raw text
+                if _detect_repetition(raw_text, check_field_lengths=False):
                     retry_state["json_retry_count"] += 1
                     retry_state["last_error_type"] = "repetition_detected"
                     retry_state["stage_retry_count"] += 1
@@ -352,6 +327,9 @@ class PortRuntime:
                     continue
 
                 try:
+                    from .tools import parse_text_to_story_json
+                    payload = parse_text_to_story_json(raw_text)
+                    
                     yield (
                         f"data: {json.dumps({'type': 'story_generated', 'turn': turn+1, 'stage': state.current_stage, 'payload': payload}, ensure_ascii=False)}\n\n"
                     )
@@ -365,11 +343,10 @@ class PortRuntime:
                         retry_state["stage_retry_count"] = 0
                 except Exception as e:
                     retry_state["json_retry_count"] += 1
-                    retry_state["last_error_type"] = f"validation_error: {e}"
-                    retry_state["last_payload"] = payload
+                    retry_state["last_error_type"] = f"parsing_validation_error: {e}"
                     retry_state["stage_retry_count"] += 1
-                    tool_result_data = {"valid": False, "error": str(e)}
-                    msg = f"Story validation failed: {e}. Retry {retry_state['json_retry_count']}/2"
+                    tool_result_data = {"valid": False, "error": str(e), "raw": raw_text[:500]}
+                    msg = f"Story parsing/validation failed: {e}. Retry {retry_state['json_retry_count']}/2"
                     yield f"data: {json.dumps({'type': 'retry', 'turn': turn+1, 'message': msg})}\n\n"
                     continue
 
@@ -494,38 +471,40 @@ class PortRuntime:
             "5단계 파이프라인(Story Creator -> Story Reviewer -> Cut Architect -> Deterministic Compile -> Polish)을 관리합니다.\n"
             "현재 상태(AgentState)를 확인하고, 다음에 호출할 도구(tool_to_use)와 파라미터(tool_payload)를 JSON으로 반환하세요.\n"
             "\n"
-            "[STAGE 1: validate_story_json — Story Creator (19-Cut Volume)]\n"
-            "- 시놉시스를 generator StoryJson 계약으로 확장합니다.\n"
-            "- root shape는 반드시 meta, phases, ending 이어야 합니다.\n"
-            "- phases는 정확히 3개이며 phaseNumber는 1, 2, 3 순서여야 합니다.\n"
-            "- 각 phase는 scenes 배열과 choice 블록을 포함해야 합니다.\n"
-            "- 각 phase의 scenes는 5개 또는 6개로 제한합니다.\n"
-            "- scenes는 narration, image, dialogue, quote, emphasis, nameInput 타입만 사용합니다.\n"
-            "- 'emphasis' 철자를 정확히 써야 하며 'enphasis' 오타는 금지합니다.\n"
-            "- image scene은 imageDescription이 필수이며, 공간/인물/조명/오브젝트가 구분 가능해야 합니다.\n"
-            "- 각 phase choice는 question, imageDescription, choices 2개를 포함해야 합니다.\n"
-            "- psychologyMapping 키는 boundary_acceptance, action_observation, control_compliance, connection_isolation 네 개만 허용됩니다.\n"
-            "- ending은 poster, endings, buttons, brandText를 포함해야 하며 poster.imageDescription이 필수입니다.\n"
-            "- required field를 생략하지 말고, 길이가 부담되면 문장을 더 짧게 씁니다.\n"
+            "[STAGE 1: validate_story_json — Story Creator]\n"
+            "- 시놉시스를 바탕으로 전체 스토리를 생성합니다.\n"
+            "- 반드시 아래의 [TEXT TAG FORMAT]을 지켜야 합니다. JSON 괄호는 절대 쓰지 마세요.\n"
             "\n"
-            "[STAGE 2: run_story_reviewer — Quality Gate]\n"
-            "- payload: StoryJson object itself, or {\"text\": \"StoryJson string\"}\n"
+            "[TEXT TAG FORMAT]\n"
+            "# META\n"
+            "TITLE: <제목>\n"
+            "SYNOPSIS: <시놉시스>\n"
+            "... (GENRE, SUMMARY 등)\n\n"
+            "# PHASE 1\n"
+            "[NARRATION] <내용>\n"
+            "[IMAGE] <이미지 묘사>\n"
+            "[DIALOGUE | 인물명] <대사>\n\n"
+            "# PHASE 1 CHOICE\n"
+            "QUESTION: <질문>\n"
+            "IMAGE_DESCRIPTION: <이미지 묘사>\n"
+            "---\n"
+            "OPTION 1: 레이블 | 서브텍스트 | 반응 | [MAP: 0, 0, 0, 0]\n"
+            "OPTION 2: 레이블 | 서브텍스트 | 반응 | [MAP: 0, 0, 0, 0]\n\n"
+            "(PHASE 2, 3 동일 반복)\n\n"
+            "# ENDING POSTER\n"
+            "TITLE_KO: <한국어 제목>\n"
+            "IMAGE_DESCRIPTION: <포스터 묘사>\n\n"
+            "# ENDING LIST\n"
+            "- ID: a | CONDITION: <조건> | BADGE: <배지> | TAGLINE: <문구> | LINES: l1, l2, l3, l4\n\n"
+            "# INTERFACE\n"
+            "BUTTONS: 버튼1, 버튼2\n"
+            "BRAND_TEXT: <브랜드 문구>\n"
             "\n"
-            "[STAGE 3: run_deterministic_compiler — Cut Architect (v1.1-local)]\n"
-            "- output root는 shared_assets + relational_cuts 이어야 합니다.\n"
-            "- shared_assets는 schemaVersion=1.0, storyId, storyTitle, locations[], characters[], palettes[], lightingPresets[]를 포함합니다.\n"
-            "- relational_cuts는 schemaVersion=1.1-local, storyId, sharedAssetsRef, cuts[]를 포함합니다.\n"
-            "- 각 cut은 sceneId, cutId, cutType, locationId, summary, continuityLock, frameRelation을 반드시 포함해야 합니다.\n"
-            "- placeholder 금지. story에서 실제 공간/인물/소품/조명 단서를 추출해야 합니다.\n"
-            "- payload schema:\n"
-            "  {\"shared_assets\":{\"schemaVersion\":\"1.0\",\"storyId\":\"\",\"storyTitle\":\"\",\"locations\":[],\"characters\":[],\"palettes\":[],\"lightingPresets\":[]},\n"
-            "   \"relational_cuts\":{\"schemaVersion\":\"1.1-local\",\"storyId\":\"\",\"sharedAssetsRef\":\"./story.shared-assets.json\",\"cuts\":[]}}\n"
-            "\n"
-            "출력 형식 (JSON strictly):\n"
+            "출력 형식 (JSON strictly for Director Response):\n"
             "{\n"
             "  \"thought\": \"현재 상황 추론\",\n"
-            "  \"tool_to_use\": \"도구 이름 또는 'none'\",\n"
-            "  \"tool_payload\": { 도구 데이터 }\n"
+            "  \"tool_to_use\": \"도구 이름\",\n"
+            "  \"tool_payload\": \"위의 [TEXT TAG FORMAT]에 따른 텍스트 본문 (JSON string 필드에 담으세요)\"\n"
             "}"
         )
 
@@ -564,12 +543,16 @@ class PortRuntime:
             # 도구 실행 분기
             if tool_name == "validate_story_json":
                 try:
-                    story_obj = StoryJSON(**payload)
+                    from .tools import parse_text_to_story_json
+                    raw_text = payload if isinstance(payload, str) else json.dumps(payload)
+                    parsed_payload = parse_text_to_story_json(raw_text)
+                    
+                    story_obj = StoryJSON(**parsed_payload)
                     tool_result_data = validate_story_json(story_obj)
-                    tool_result_data["story"] = payload
+                    tool_result_data["story"] = parsed_payload
                     if tool_result_data.get("valid"):
                         state.current_stage = 2
-                        state.story_data = payload
+                        state.story_data = parsed_payload
                 except Exception as e:
                     tool_result_data = {"valid": False, "error": str(e)}
             

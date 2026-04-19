@@ -133,21 +133,28 @@ def _call_llm(
     max_tokens: int = 512,
     num_ctx: int = NUM_CTX,
     top_p: float = 1.0,
+    json_mode: bool = True,
 ) -> str:
     """Raw LLM call returning the content string."""
+    extra_body = {"options": {"num_ctx": num_ctx}}
+    
+    response_format = None
+    if json_mode:
+        response_format = {"type": "json_object"}
+
     response = client.chat.completions.create(
         model=model,
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
-        response_format={"type": "json_object"},
+        response_format=response_format,
         temperature=temperature,
         max_tokens=max_tokens,
         top_p=top_p,
         frequency_penalty=0.0,
         presence_penalty=0.0,
-        extra_body={"options": {"num_ctx": num_ctx}},
+        extra_body=extra_body,
     )
     raw = response.choices[0].message.content or ""
     logger.info(f"Raw LLM output length: {len(raw)} chars. Preview: {raw[:300]}")
@@ -221,14 +228,16 @@ def ask_llm_generate(
     model: str = DEFAULT_MODEL,
     max_tokens: int = STORY_MAX_TOKENS,
     num_ctx: int = STORY_NUM_CTX,
-) -> Dict[str, Any]:
+    json_mode: bool = False,
+) -> Any:
     """
     Long content-generation call (e.g. story body).
-    Temperature 0.6, with a larger token budget for StoryJson generation.
-    Returns the parsed JSON dict or {} on total failure.
+    By default, now uses json_mode=False for structured text extraction.
+    If json_mode=True, it returns a parsed JSON dict.
+    Otherwise, returns the raw string.
     """
     try:
-        logger.info(f"[Generate] Calling LLM ({model})")
+        logger.info(f"[Generate] Calling LLM ({model}) | JSON Mode: {json_mode}")
         raw = _call_llm(
             system_prompt, user_prompt,
             model=model,
@@ -236,20 +245,25 @@ def ask_llm_generate(
             max_tokens=max_tokens,
             num_ctx=num_ctx,
             top_p=0.9,
+            json_mode=json_mode,
         )
-        result = _parse_with_retry(
-            raw,
-            model=model,
-            repair_max_tokens=max_tokens,
-            repair_num_ctx=num_ctx,
-        )
-        if result:
-            return result
-        logger.error("[Generate] All parse attempts failed.")
-        return {}
+        
+        if json_mode:
+            result = _parse_with_retry(
+                raw,
+                model=model,
+                repair_max_tokens=max_tokens,
+                repair_num_ctx=num_ctx,
+            )
+            if result:
+                return result
+            logger.error("[Generate] All parse attempts failed.")
+            return {}
+        
+        return raw
     except Exception as e:
         logger.error(f"[Generate] LLM call error: {e}")
-        return {}
+        return {} if json_mode else ""
 
 
 # ── Legacy compat shim (used by run_turn_loop) ────────────────────────
